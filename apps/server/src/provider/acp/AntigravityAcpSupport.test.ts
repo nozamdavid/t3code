@@ -28,20 +28,59 @@ const modelConfig = {
   ],
 } satisfies EffectAcpSchema.SessionConfigOption;
 
-function makeModelRuntime(
-  configOptions: ReadonlyArray<EffectAcpSchema.SessionConfigOption> = [modelConfig],
-  failure?: EffectAcpErrors.AcpError,
-) {
-  const selections: string[] = [];
-  const setModel = Effect.fn("AntigravityAcpSupportTest.setModel")(function* (model: string) {
-    if (failure) return yield* failure;
-    selections.push(model);
-  });
+const groupedSession = {
+  configOptions: [
+    {
+      id: "model",
+      name: "Model",
+      category: "model",
+      type: "select",
+      currentValue: "gemini-3.8-flash",
+      options: [
+        { value: "gemini-3.8-flash", name: "Gemini 3.8 Flash" },
+        { value: "claude-opus-5-5-high", name: "Claude Opus 5.5 (High)" },
+      ],
+    },
+    {
+      id: "thinking_level",
+      name: "Thinking",
+      category: "thought_level",
+      type: "select",
+      currentValue: "high",
+      options: [
+        { value: "low", name: "Low" },
+        { value: "high", name: "High" },
+      ],
+    },
+  ],
+  models: {
+    currentModelId: "gemini-3.8-flash-high",
+    availableModels: [
+      { modelId: "gemini-3.8-flash-high", name: "Gemini 3.8 Flash (High)" },
+      { modelId: "gemini-3.8-flash-low", name: "Gemini 3.8 Flash (Low)" },
+      { modelId: "claude-opus-5-5-high", name: "Claude Opus 5.5 (High)" },
+    ],
+  },
+} satisfies Parameters<typeof applyAntigravityAcpModelSelection>[0]["session"];
+
+function makeModelRuntime(failure?: EffectAcpErrors.AcpError) {
+  const selections: Array<{ readonly method: string; readonly model: string }> = [];
+  const select = (method: string, model: string) =>
+    failure
+      ? Effect.fail(failure)
+      : Effect.sync(() => {
+          selections.push({ method, model });
+        });
   return {
-    runtime: { getConfigOptions: Effect.succeed(configOptions), setModel },
+    runtime: {
+      setModel: (model: string) => select("session/set_config_option", model),
+      setSessionModel: (model: string) => select("session/set_model", model).pipe(Effect.as({})),
+    },
     selections,
   };
 }
+
+const configSelection = (model: string) => ({ method: "session/set_config_option", model });
 
 describe("applyAntigravityAcpModelSelection", () => {
   it.effect("restores the saved model instead of the cold-resume default", () =>
@@ -49,12 +88,28 @@ describe("applyAntigravityAcpModelSelection", () => {
       const { runtime, selections } = makeModelRuntime();
       const model = yield* applyAntigravityAcpModelSelection({
         runtime,
+        session: { configOptions: [modelConfig] },
         model: "gemini-saved",
         mapError: (cause) => cause,
       });
 
       expect(model).toBe("gemini-saved");
-      expect(selections).toEqual(["gemini-saved"]);
+      expect(selections).toEqual([configSelection("gemini-saved")]);
+    }),
+  );
+
+  it.effect("reapplies an explicit selection even when setup reports the same model", () =>
+    Effect.gen(function* () {
+      const { runtime, selections } = makeModelRuntime();
+      const model = yield* applyAntigravityAcpModelSelection({
+        runtime,
+        session: { configOptions: [{ ...modelConfig, currentValue: "gemini-saved" }] },
+        model: "gemini-saved",
+        mapError: (cause) => cause,
+      });
+
+      expect(model).toBe("gemini-saved");
+      expect(selections).toEqual([configSelection("gemini-saved")]);
     }),
   );
 
@@ -65,6 +120,7 @@ describe("applyAntigravityAcpModelSelection", () => {
         const { runtime, selections } = makeModelRuntime();
         const model = yield* applyAntigravityAcpModelSelection({
           runtime,
+          session: { configOptions: [modelConfig] },
           model: requestedModel,
           mapError: (cause) => cause,
         });
@@ -79,16 +135,18 @@ describe("applyAntigravityAcpModelSelection", () => {
       const { runtime, selections } = makeModelRuntime();
       const model = yield* applyAntigravityAcpModelSelection({
         runtime,
+        session: { configOptions: [modelConfig] },
         model: ANTIGRAVITY_DEFAULT_MODEL,
         defaultModel: "gemini-saved",
         mapError: (cause) => cause,
       });
       expect(model).toBe("gemini-saved");
-      expect(selections).toEqual(["gemini-saved"]);
+      expect(selections).toEqual([configSelection("gemini-saved")]);
 
       const { runtime: other, selections: otherSelections } = makeModelRuntime();
       const fallback = yield* applyAntigravityAcpModelSelection({
         runtime: other,
+        session: { configOptions: [modelConfig] },
         model: ANTIGRAVITY_DEFAULT_MODEL,
         defaultModel: "gemini-not-offered",
         mapError: (cause) => cause,
@@ -105,6 +163,7 @@ describe("applyAntigravityAcpModelSelection", () => {
         const { runtime, selections } = makeModelRuntime();
         const error = yield* applyAntigravityAcpModelSelection({
           runtime,
+          session: { configOptions: [modelConfig] },
           model,
           mapError: (cause) => cause,
         }).pipe(Effect.flip);
@@ -120,20 +179,72 @@ describe("applyAntigravityAcpModelSelection", () => {
 
   it.effect("accepts exact model IDs from grouped native options", () =>
     Effect.gen(function* () {
-      const { runtime, selections } = makeModelRuntime([
-        {
-          ...modelConfig,
-          options: [{ groupId: "gemini", name: "Gemini", options: modelConfig.options }],
-        },
-      ]);
+      const { runtime, selections } = makeModelRuntime();
       const model = yield* applyAntigravityAcpModelSelection({
         runtime,
+        session: {
+          configOptions: [
+            {
+              ...modelConfig,
+              options: [{ groupId: "gemini", name: "Gemini", options: modelConfig.options }],
+            },
+          ],
+        },
         model: "gemini-saved",
         mapError: (cause) => cause,
       });
 
       expect(model).toBe("gemini-saved");
-      expect(selections).toEqual(["gemini-saved"]);
+      expect(selections).toEqual([configSelection("gemini-saved")]);
+    }),
+  );
+
+  it.effect.each(["gemini-3.8-flash-low", "claude-opus-5-5-high"])(
+    "selects %s by concrete ID when the model option groups thinking levels",
+    (requestedModel) =>
+      Effect.gen(function* () {
+        const { runtime, selections } = makeModelRuntime();
+        const model = yield* applyAntigravityAcpModelSelection({
+          runtime,
+          session: groupedSession,
+          model: requestedModel,
+          mapError: (cause) => cause,
+        });
+
+        expect(model).toBe(requestedModel);
+        expect(selections).toEqual([{ method: "session/set_model", model: requestedModel }]);
+      }),
+  );
+
+  it.effect(
+    "reports the concrete native default when the model option groups thinking levels",
+    () =>
+      Effect.gen(function* () {
+        const { runtime, selections } = makeModelRuntime();
+        const model = yield* applyAntigravityAcpModelSelection({
+          runtime,
+          session: groupedSession,
+          model: ANTIGRAVITY_DEFAULT_MODEL,
+          mapError: (cause) => cause,
+        });
+
+        expect(model).toBe("gemini-3.8-flash-high");
+        expect(selections).toEqual([]);
+      }),
+  );
+
+  it.effect("reports a native model-selection failure through the adapter error mapper", () =>
+    Effect.gen(function* () {
+      const nativeError = EffectAcpErrors.AcpRequestError.invalidParams("Model access changed.");
+      const { runtime } = makeModelRuntime(nativeError);
+      const error = yield* applyAntigravityAcpModelSelection({
+        runtime,
+        session: { configOptions: [modelConfig] },
+        model: "gemini-saved",
+        mapError: (cause) => ({ operation: "select-model", cause }),
+      }).pipe(Effect.flip);
+
+      expect(error).toEqual({ operation: "select-model", cause: nativeError });
     }),
   );
 });

@@ -769,12 +769,30 @@ export const AntigravitySettings = makeProviderSettingsSchema(
         providerSettingsForm: { placeholder: "Automatic", clearWhenEmpty: "persist" },
       }),
     ),
+    useCustomClientInfo: Schema.Boolean.pipe(
+      Schema.withDecodingDefault(Effect.succeed(false)),
+      Schema.annotateKey({
+        title: "Claude and GPT-OSS models",
+        description:
+          "Report T3 Code as Zed so Antigravity lists Claude and GPT-OSS models. Google controls this allowlist and may change it.",
+        providerSettingsForm: { control: "switch" },
+      }),
+    ),
     customModels: Schema.Array(CustomModelSetting).pipe(
       Schema.withDecodingDefault(Effect.succeed([])),
       Schema.annotateKey({ providerSettingsForm: { hidden: true } }),
     ),
   },
-  { order: ["authMethod", "apiKey", "gcpProject", "gcpLocation", "binaryPath"] },
+  {
+    order: [
+      "authMethod",
+      "apiKey",
+      "gcpProject",
+      "gcpLocation",
+      "useCustomClientInfo",
+      "binaryPath",
+    ],
+  },
 );
 export type AntigravitySettings = typeof AntigravitySettings.Type;
 

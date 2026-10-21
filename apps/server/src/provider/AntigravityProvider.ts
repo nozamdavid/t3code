@@ -32,6 +32,8 @@ import {
 } from "@t3tools/provider-core/server/snapshotProbe";
 import { resolveUsageLimitsAfterProbe } from "@t3tools/provider-core/server/usageLimits";
 
+import { antigravityModelChoices } from "./acp/AntigravityAcpSupport.ts";
+
 const EMPTY_MODEL_CAPABILITIES = createModelCapabilities({ optionDescriptors: [] });
 const MAX_WORKSPACE_SNAPSHOTS = 32;
 const HEALTH_CHECK_TIMEOUT = "90 seconds";
@@ -44,25 +46,14 @@ type SessionSetupResult = Pick<
   "configOptions" | "models"
 >;
 
+/** Returns undefined when the session does not name its concrete model IDs. */
 export function buildAntigravityModelsFromSession(
   setup: SessionSetupResult,
-): ReadonlyArray<ServerProviderModel> {
-  const config = setup.configOptions?.find(
-    (option) => option.id === "model" || option.category === "model",
-  );
-  const currentValue =
-    config?.type === "select" ? config.currentValue : setup.models?.currentModelId;
-  const entries =
-    config?.type === "select"
-      ? config.options.flatMap((entry) => ("value" in entry ? [entry] : entry.options))
-      : config === undefined
-        ? (setup.models?.availableModels.map((model) => ({
-            value: model.modelId,
-            name: model.name,
-          })) ?? [])
-        : [];
+): ReadonlyArray<ServerProviderModel> | undefined {
+  const choices = antigravityModelChoices(setup);
+  if (choices === undefined) return undefined;
   const seen = new Set<string>();
-  return entries.flatMap((entry): ServerProviderModel[] => {
+  return choices.options.flatMap((entry): ServerProviderModel[] => {
     if (!entry.value.trim() || seen.has(entry.value)) return [];
     seen.add(entry.value);
     return [
@@ -70,7 +61,7 @@ export function buildAntigravityModelsFromSession(
         slug: entry.value,
         name: entry.name.trim() ? entry.name : entry.value,
         isCustom: false,
-        ...(entry.value === currentValue
+        ...(entry.value === choices.currentModelId
           ? { isDefault: true, aliases: [ANTIGRAVITY_DEFAULT_MODEL] }
           : {}),
         capabilities: EMPTY_MODEL_CAPABILITIES,
@@ -304,7 +295,7 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
             published: draft.usageLimits,
             probed: usageLimits ?? draft.usageLimits,
           }),
-          models: buildAntigravityModelsFromSession(started.sessionSetupResult),
+          models: buildAntigravityModelsFromSession(started.sessionSetupResult) ?? draft.models,
           supportsTextGeneration,
           ...(cwd
             ? {
@@ -329,7 +320,7 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
   ) {
     const models = buildAntigravityModelsFromSession({ configOptions });
     yield* SubscriptionRef.update(metadata, (state) => {
-      if (state.draft.auth.status !== "authenticated") return state;
+      if (models === undefined || state.draft.auth.status !== "authenticated") return state;
       return { ...state, draft: { ...state.draft, models } };
     });
   });

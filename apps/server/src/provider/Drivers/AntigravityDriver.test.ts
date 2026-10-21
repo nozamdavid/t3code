@@ -334,6 +334,32 @@ it.layer(layerTest)("AntigravityDriver", (it) => {
   );
 
   it.effect.skipIf(windowsHost)(
+    "reports the stock client identity unless custom client info is enabled",
+    () =>
+      Effect.gen(function* () {
+        const stock = yield* makeHarness();
+        yield* stock.refresh();
+        const stockInitialize = (yield* stock.readRequests).find(
+          (request) => request.method === "initialize",
+        );
+        expect(stockInitialize?.params?.clientInfo).toEqual({
+          name: "t3-code",
+          version: "0.0.0",
+        });
+
+        const custom = yield* makeHarness({ config: { useCustomClientInfo: true } });
+        yield* custom.refresh();
+        const customInitialize = (yield* custom.readRequests).find(
+          (request) => request.method === "initialize",
+        );
+        expect(customInitialize?.params?.clientInfo).toEqual({
+          name: "zed",
+          version: "0.0.0",
+        });
+      }).pipe(Effect.scoped),
+  );
+
+  it.effect.skipIf(windowsHost)(
     "closes refresh processes and clears account metadata when Google sign-in is required",
     () =>
       Effect.gen(function* () {

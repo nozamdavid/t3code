@@ -243,6 +243,7 @@ export const AntigravityDriver: ProviderDriver<
       );
       const runtime = yield* makeAntigravityAcpRuntime({
         ...input,
+        useCustomClientInfo: settings.useCustomClientInfo,
         authMethod: auth.authMethod,
         childProcessSpawner: spawner,
         spawn: buildAntigravityAcpSpawnInput({
@@ -297,7 +298,6 @@ export const AntigravityDriver: ProviderDriver<
       );
       const runtime = yield* makeRuntime({
         cwd,
-        clientInfo: { name: "t3-code-provider-setup", version: "0.0.0" },
         mcpServers: [],
         ...(input.onAuthorizationUrl ? { onAuthorizationUrl: input.onAuthorizationUrl } : {}),
       });
@@ -439,12 +439,7 @@ export const AntigravityDriver: ProviderDriver<
       profileDirectory,
       defaultModel,
       withProcess: authFlow.withProcess,
-      makeRuntime: (cwd) =>
-        makeRuntime({
-          cwd,
-          clientInfo: { name: "t3-code-text", version: "0.0.0" },
-          mcpServers: [],
-        }),
+      makeRuntime: (cwd) => makeRuntime({ cwd, mcpServers: [] }),
     });
 
     const refreshModels = Effect.fn("AntigravityDriver.refreshModels")(

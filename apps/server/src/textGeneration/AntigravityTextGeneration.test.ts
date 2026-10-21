@@ -146,7 +146,13 @@ const makeFixture = Effect.fn("makeAntigravityTextGenerationFixture")(function* 
             return {
               sessionId: nativeSessionId,
               initializeResult: { protocolVersion: 1 },
-              sessionSetupResult: { sessionId: nativeSessionId },
+              sessionSetupResult: {
+                sessionId: nativeSessionId,
+                models: {
+                  currentModelId: modelSelection.model,
+                  availableModels: [{ modelId: modelSelection.model, name: "Gemini test" }],
+                },
+              },
               modelConfigId: "model",
             };
           }),
@@ -155,20 +161,15 @@ const makeFixture = Effect.fn("makeAntigravityTextGenerationFixture")(function* 
             state.selectedModes.push(mode);
             return {};
           }),
-        getConfigOptions: Effect.succeed([
-          {
-            id: "model",
-            name: "Model",
-            category: "model",
-            type: "select",
-            currentValue: modelSelection.model,
-            options: [{ value: modelSelection.model, name: "Gemini test" }],
-          },
-        ]),
         getEvents: () => Stream.fromQueue(events),
         setModel: (model) =>
           Effect.sync(() => {
             state.selectedModels.push(model);
+          }),
+        setSessionModel: (model) =>
+          Effect.sync(() => {
+            state.selectedModels.push(model);
+            return {};
           }),
         prompt: (request) =>
           Effect.gen(function* () {
