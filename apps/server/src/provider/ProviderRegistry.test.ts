@@ -30,6 +30,7 @@ import {
   ServerProvider,
   type ServerProviderSlashCommand,
   type ServerSettings as ContractServerSettings,
+  type ProviderInstanceConfigMap,
 } from "@t3tools/contracts";
 import { HttpClient, HttpClientResponse } from "effect/http";
 import { ChildProcessSpawner } from "effect/process";
@@ -59,6 +60,7 @@ import {
 } from "./providerStatusCache.ts";
 import { COMPACT_SLASH_COMMAND } from "@t3tools/provider-core/server/snapshotProbe";
 import type {
+  ProviderDriver,
   ProviderInstance,
   ProviderWorkspaceSnapshot,
 } from "@t3tools/provider-core/server/driver";
@@ -2136,6 +2138,162 @@ it.layer(
           assert.include(unavailable, "ghost_current");
           assert.notInclude(unavailable, "ghost_stale");
         }),
+    );
+  });
+
+  describe("rebuilt instance model catalogs", () => {
+    const driverKind = ProviderDriverKind.make("antigravity");
+    const instanceId = ProviderInstanceId.make("antigravity");
+    const ModelConfig = Schema.Struct({
+      useCustomClientInfo: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+    });
+    const catalog = (useCustomClientInfo: boolean) =>
+      (useCustomClientInfo ? ["gemini-test", "claude-test", "gpt-oss-test"] : ["gemini-test"]).map(
+        (slug) => ({ slug, name: slug, isCustom: false, capabilities: null }),
+      );
+
+    const configMap = (useCustomClientInfo: boolean): ProviderInstanceConfigMap => ({
+      [instanceId]: {
+        driver: driverKind,
+        enabled: true,
+        config: { useCustomClientInfo },
+      },
+    });
+
+    it.effect("refreshes the catalog when a saved config changes its model discovery", () =>
+      Effect.gen(function* () {
+        let creates = 0;
+        let refreshes = 0;
+        const driver = {
+          driverKind,
+          metadata: { displayName: "Antigravity" },
+          configSchema: ModelConfig,
+          defaultConfig: () => ({ useCustomClientInfo: false }),
+          create: (input) =>
+            Effect.gen(function* () {
+              creates += 1;
+              const models = yield* Ref.make<ReadonlyArray<ServerProvider["models"][number]>>([]);
+              const changes = yield* PubSub.unbounded<ServerProvider>();
+              const snapshot = Effect.gen(function* () {
+                const provider: ServerProvider = {
+                  instanceId: input.instanceId,
+                  driver: driverKind,
+                  status: "ready",
+                  enabled: input.enabled,
+                  installed: true,
+                  auth: { status: "authenticated" },
+                  checkedAt: "2026-01-01T00:00:00.000Z",
+                  version: "1.0.0",
+                  models: yield* Ref.get(models),
+                  slashCommands: [],
+                  skills: [],
+                };
+                return provider;
+              });
+              return {
+                instanceId: input.instanceId,
+                driverKind,
+                continuationIdentity: {
+                  driverKind,
+                  continuationKey: `${driverKind}:instance:${input.instanceId}`,
+                },
+                displayName: input.displayName,
+                enabled: input.enabled,
+                snapshot: {
+                  resolveMaintenance: () =>
+                    Effect.succeed(
+                      makeManualOnlyProviderMaintenanceCapabilities({
+                        provider: driverKind,
+                        packageName: null,
+                      }),
+                    ),
+                  getSnapshot: snapshot,
+                  refresh: snapshot,
+                  streamChanges: Stream.fromPubSub(changes),
+                  applyUsageLimits: () => Effect.void,
+                },
+                orchestrationAdapter: {} as ProviderInstance["orchestrationAdapter"],
+                textGeneration: {} as ProviderInstance["textGeneration"],
+                refreshModels: () =>
+                  Effect.gen(function* () {
+                    refreshes += 1;
+                    yield* Ref.set(models, catalog(input.config.useCustomClientInfo));
+                    yield* PubSub.publish(changes, yield* snapshot);
+                  }),
+              } satisfies ProviderInstance;
+            }),
+        } satisfies ProviderDriver<typeof ModelConfig.Type>;
+
+        const scope = yield* Scope.make();
+        yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
+        const { registry: instanceRegistry, mutator } =
+          yield* ProviderInstanceRegistry.makeProviderInstanceRegistry({
+            drivers: [driver],
+            configMap: configMap(false),
+          }).pipe(Effect.provideService(Scope.Scope, scope));
+        const services = yield* Layer.build(
+          ProviderRegistry.layer.pipe(
+            Layer.provideMerge(
+              Layer.succeed(ProviderInstanceRegistry.ProviderInstanceRegistry, instanceRegistry),
+            ),
+            Layer.provideMerge(
+              ServerConfig.layerTest(process.cwd(), {
+                prefix: "t3-provider-registry-model-refresh-",
+              }),
+            ),
+            Layer.provideMerge(layerTestHttpClient),
+            Layer.provideMerge(ProviderLatestVersions.layer),
+            Layer.provideMerge(NodeServices.layer),
+            Layer.provideMerge(layerBackgroundPolicyAlwaysRun),
+          ),
+        ).pipe(Scope.provide(scope));
+
+        yield* Effect.gen(function* () {
+          const registry = yield* ProviderRegistry.ProviderRegistry;
+          const slugs = registry.streamChanges.pipe(
+            Stream.map(
+              (providers) =>
+                providers
+                  .find((provider) => provider.instanceId === instanceId)
+                  ?.models.map((model) => model.slug) ?? [],
+            ),
+          );
+
+          const initial = yield* instanceRegistry.getInstance(instanceId);
+          assert.isDefined(initial?.refreshModels);
+          const baseline = yield* Stream.toPull(
+            slugs.pipe(Stream.filter((value) => value.length > 0)),
+          );
+          yield* initial!.refreshModels!();
+          assert.deepStrictEqual((yield* baseline)[0], ["gemini-test"]);
+
+          const custom = yield* Stream.toPull(
+            slugs.pipe(Stream.filter((value) => value.includes("claude-test"))),
+          );
+          yield* mutator.reconcile(configMap(true));
+          assert.deepStrictEqual((yield* custom)[0], [
+            "gemini-test",
+            "claude-test",
+            "gpt-oss-test",
+          ]);
+          assert.strictEqual(creates, 2);
+          assert.strictEqual(refreshes, 2);
+
+          const unchanged = yield* instanceRegistry.getInstance(instanceId);
+          yield* mutator.reconcile(configMap(true));
+          assert.strictEqual(yield* instanceRegistry.getInstance(instanceId), unchanged);
+          assert.strictEqual(creates, 2);
+          assert.strictEqual(refreshes, 2);
+
+          const restored = yield* Stream.toPull(
+            slugs.pipe(Stream.filter((value) => value.length === 1 && value[0] === "gemini-test")),
+          );
+          yield* mutator.reconcile(configMap(false));
+          assert.deepStrictEqual((yield* restored)[0], ["gemini-test"]);
+          assert.strictEqual(creates, 3);
+          assert.strictEqual(refreshes, 3);
+        }).pipe(Effect.provide(services));
+      }),
     );
   });
 

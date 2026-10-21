@@ -828,6 +828,31 @@ export const layer = Layer.effect(
             }).pipe(Effect.ignoreCause({ log: true })),
           { concurrency: "unbounded", discard: true },
         );
+        // A rebuilt instance was created from changed settings, so a model
+        // catalog discovered through the driver's own process (Antigravity's
+        // ACP session) still belongs to the previous config. Re-discover it
+        // against the live instance; the subscription above publishes the
+        // result, and failures surface through the snapshot (e.g. sign-in).
+        yield* Effect.forEach(
+          newlyAdded,
+          ([instanceId, instance]) =>
+            rebuiltInstanceIds.has(instanceId) &&
+            instance.enabled &&
+            instance.refreshModels !== undefined
+              ? instance.refreshModels().pipe(
+                  Effect.catchCause((cause) =>
+                    Cause.hasInterruptsOnly(cause)
+                      ? Effect.void
+                      : Effect.logWarning("provider model refresh after settings change failed", {
+                          instanceId,
+                          cause: Cause.pretty(cause),
+                        }),
+                  ),
+                  Effect.forkDetach,
+                )
+              : Effect.void,
+          { concurrency: "unbounded", discard: true },
+        );
         yield* upsertProviders(unavailableProviders, {
           persist: false,
           replace: true,
