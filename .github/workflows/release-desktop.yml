@@ -64,6 +64,12 @@ on:
         required: false
         default: false
         type: boolean
+      # Whether the job opens the packaged app against a seeded database and
+      # opens a thread before uploading it. Linux AppImage or macOS DMG.
+      launch_check:
+        required: false
+        default: false
+        type: boolean
       # A runner of the target's own platform and architecture, for a `runner`
       # that cannot execute the target. The build job skips everything that
       # runs the packaged binaries, and a second job runs it there.
@@ -253,18 +259,13 @@ jobs:
           if [[ "${{ inputs.version }}" =~ -nightly\.[0-9]{8}\.[0-9]+$ ]]; then brand=nightly; fi
           node scripts/apply-web-brand-assets.ts "$brand" apps/server/dist/client
 
-      # The single-executable is built with a Node that supports --build-sea
-      # (25.7+); the repo itself stays on the engines.node version. A native
-      # build injects into the runner's own Node; a Windows target downloads its
-      # node.exe.
+      # Setup Vite+ selects the exact engines.node version from package.json.
+      # Native builds embed that executable; cross-target builds download the
+      # same version for their target.
       - name: Build CLI single-executable
         if: inputs.cli_archive
         shell: bash
         env:
-          # The exact version, not a major: vp downloads it from nodejs.org/dist on
-          # the runner, and only exact versions have a dist directory. Keep in
-          # step with SEA_NODE_VERSION in apps/server/vite.config.ts.
-          VP_NODE_VERSION: "26.8.2"
           # The executable bundles the server again, so it needs the same stamp
           # as release.yml's JS bundle.
           T3CODE_TELEMETRY_CHANNEL: ${{ github.repository == 'pingdotgg/t3code' && inputs.release_channel || 'dev' }}
@@ -521,6 +522,38 @@ jobs:
           fi
 
           vp run dist:desktop:artifact "${args[@]}"
+
+      # A build can package fine and still not open (a missing module in the
+      # backend or the bundle). This launches the app from the shipped
+      # AppImage or DMG.
+      - name: Launch check
+        if: inputs.launch_check
+        shell: bash
+        run: |
+          set -euo pipefail
+          check=(node scripts/smoke-desktop-app.ts --artifacts-dir "$RUNNER_TEMP/desktop-launch-check")
+          if [[ "${{ inputs.platform }}" == "mac" ]]; then
+            mount="$RUNNER_TEMP/desktop-launch-dmg"
+            hdiutil attach -nobrowse -readonly -mountpoint "$mount" "$(ls "$GITHUB_WORKSPACE"/release/*.dmg)"
+            trap 'hdiutil detach "$mount" -force >/dev/null || true' EXIT
+            app=$(ls -d "$mount"/*.app)
+            executable=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$app/Contents/Info.plist")
+            "${check[@]}" --executable "$app/Contents/MacOS/$executable"
+          else
+            sudo apt-get install -y xvfb
+            appimage=$(ls "$GITHUB_WORKSPACE"/release/*.AppImage)
+            chmod +x "$appimage"
+            (cd "$RUNNER_TEMP" && "$appimage" --appimage-extract >/dev/null)
+            xvfb-run -a "${check[@]}" --executable "$RUNNER_TEMP/squashfs-root/t3code"
+          fi
+
+      - name: Upload launch check output
+        if: failure() && inputs.launch_check
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: desktop-launch-check-${{ inputs.platform }}-${{ inputs.arch }}
+          path: ${{ runner.temp }}/desktop-launch-check
+          if-no-files-found: ignore
 
       # The verify job runs what this host could not: the packaged natives and
       # the CLI. Its scripts are bundled so that job needs no install.

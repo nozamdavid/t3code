@@ -94,7 +94,15 @@ export function AssistantCitationChip({
         contextElement: activeSourceAnchor.source,
         getBoundingClientRect: () => {
           const rects = activeSourceAnchor.range.getClientRects();
-          return rects.item(rects.length - 1) ?? activeSourceAnchor.range.getBoundingClientRect();
+          const rect =
+            rects.item(rects.length - 1) ?? activeSourceAnchor.range.getBoundingClientRect();
+          // Code blocks and tables scroll sideways inside the message, so the cited
+          // text can end in their hidden overflow. Base UI only shifts the popup while
+          // it still touches the anchor, so clamp the anchor to the message's width.
+          const bounds = activeSourceAnchor.source.getBoundingClientRect();
+          const left = Math.min(Math.max(rect.left, bounds.left), bounds.right);
+          const right = Math.max(Math.min(rect.right, bounds.right), left);
+          return new DOMRect(left, rect.top, right - left, rect.height);
         },
       }
     : undefined;
@@ -116,7 +124,7 @@ export function AssistantCitationChip({
   const composerSourceLink = (
     <Link
       {...sourceLinkProps}
-      className="inline-flex h-full min-w-0 items-center gap-[0.33em] rounded-sm text-inherit no-underline focus-visible:outline-2 focus-visible:outline-foreground"
+      className="inline-flex min-w-0 items-center gap-[0.2em] self-baseline text-inherit no-underline focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-current rounded-sm"
       aria-label={`View cited assistant text: ${label}`}
     >
       <QuoteIcon aria-hidden="true" />
