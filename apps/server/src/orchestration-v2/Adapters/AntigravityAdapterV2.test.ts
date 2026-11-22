@@ -2569,8 +2569,8 @@ describe("AntigravityAdapterV2 prompt suggestions", () => {
           }
           return startResult;
         }),
-      loadSession: () => Effect.succeed(startResult),
-      resumeSession: () => Effect.succeed(startResult),
+      loadSession: (sessionId) => Effect.succeed({ ...startResult, sessionId }),
+      resumeSession: (sessionId) => Effect.succeed({ ...startResult, sessionId }),
       forkSession: () => Effect.succeed(startResult),
       listSessions: () => Effect.succeed({ sessions: [] }),
       closeSession: () => Effect.succeed({}),
@@ -2678,6 +2678,7 @@ describe("AntigravityAdapterV2 prompt suggestions", () => {
       ordinal: number,
       overrides?: {
         readonly text?: string;
+        readonly inlineContextLength?: number;
         readonly delegated?: boolean;
         readonly continuation?: boolean;
       },
@@ -2693,6 +2694,9 @@ describe("AntigravityAdapterV2 prompt suggestions", () => {
       });
       return {
         ...turn,
+        ...(overrides?.inlineContextLength === undefined
+          ? {}
+          : { inlineContextLength: overrides.inlineContextLength }),
         runId: RunId.make(`run-suggestion-${ordinal}`),
         runOrdinal: ordinal,
         providerTurnOrdinal: ordinal,
@@ -2749,7 +2753,11 @@ describe("AntigravityAdapterV2 prompt suggestions", () => {
               }),
           });
 
-        const turn1 = makeTurn(1, { text: "Add a subtract function." });
+        const handoffPrefix = "Earlier handoff summary\n\n";
+        const turn1 = makeTurn(1, {
+          text: `${handoffPrefix}Add a subtract function.`,
+          inlineContextLength: handoffPrefix.length,
+        });
         yield* session.startTurn(turn1);
         const events1 = yield* until((event) => event.type === "prompt_suggestion.updated");
         const suggestionEvent = events1.find((event) => event.type === "prompt_suggestion.updated");
@@ -2770,11 +2778,22 @@ describe("AntigravityAdapterV2 prompt suggestions", () => {
           },
         ]);
 
-        yield* Ref.set(enabled, false);
-        const turn2 = makeTurn(2, { text: "Now add divide." });
+        // Later turns still strip the earlier handoff turn's inline context prefix.
+        const turn2 = makeTurn(2, { text: "Now add multiply." });
         yield* session.startTurn(turn2);
+        yield* until((event) => event.type === "prompt_suggestion.updated");
+        assert.deepEqual(sampled[1]?.messages, [
+          { role: "user", text: "Add a subtract function." },
+          { role: "assistant", text: "Added subtract in math.ts." },
+          { role: "user", text: "Now add multiply." },
+          { role: "assistant", text: "Added subtract in math.ts." },
+        ]);
+
+        yield* Ref.set(enabled, false);
+        const turn3 = makeTurn(3, { text: "Now add divide." });
+        yield* session.startTurn(turn3);
         yield* until((event) => event.type === "turn.terminal");
-        assert.equal(sampled.length, 1);
+        assert.equal(sampled.length, 2);
       }).pipe(Effect.provide(layerSession)),
   );
 
@@ -2801,7 +2820,7 @@ describe("AntigravityAdapterV2 prompt suggestions", () => {
   );
 
   it.effect(
-    "cancels an in-flight suggestion on next turn, rollback, forced session replacement, or admitted continuation",
+    "cancels an in-flight suggestion on next turn, rollback, forced session replacement, resume, snapshot switch, or admitted continuation",
     () =>
       Effect.gen(function* () {
         const started = [
@@ -2809,8 +2828,12 @@ describe("AntigravityAdapterV2 prompt suggestions", () => {
           yield* Deferred.make<void>(),
           yield* Deferred.make<void>(),
           yield* Deferred.make<void>(),
+          yield* Deferred.make<void>(),
+          yield* Deferred.make<void>(),
         ] as const;
         const interrupted = [
+          yield* Deferred.make<void>(),
+          yield* Deferred.make<void>(),
           yield* Deferred.make<void>(),
           yield* Deferred.make<void>(),
           yield* Deferred.make<void>(),
@@ -2836,7 +2859,7 @@ describe("AntigravityAdapterV2 prompt suggestions", () => {
             Effect.gen(function* () {
               const index = callCount;
               callCount += 1;
-              if (index < 4) {
+              if (index < 6) {
                 yield* Deferred.succeed(started[index]!, undefined);
                 return yield* Effect.never.pipe(
                   Effect.onInterrupt(() =>
@@ -2888,11 +2911,48 @@ describe("AntigravityAdapterV2 prompt suggestions", () => {
         });
         yield* Deferred.await(interrupted[2]);
 
-        // 4. Admitting a late continuation cancels the fourth in-flight suggestion and suppresses
-        //    sampling while the continuation remains pending.
+        // 4. Resuming a different native session cancels the fourth in-flight suggestion.
         yield* session.startTurn(makeTurn(4, { text: "Fourth turn" }));
         yield* until((event) => event.type === "turn.terminal");
         yield* Deferred.await(started[3]);
+
+        const otherProviderThread = {
+          ...providerThread,
+          nativeThreadRef: {
+            driver: providerThread.driver,
+            nativeId: "mock-other-session",
+            strength: "strong" as const,
+          },
+        };
+        yield* session.resumeThread({
+          providerThread: otherProviderThread,
+          modelSelection,
+        });
+        yield* Deferred.await(interrupted[3]);
+        yield* session.resumeThread({
+          providerThread,
+          modelSelection,
+        });
+
+        // 5. Reading a snapshot for a different native session cancels the fifth in-flight suggestion.
+        yield* session.startTurn(makeTurn(5, { text: "Fifth turn" }));
+        yield* until((event) => event.type === "turn.terminal");
+        yield* Deferred.await(started[4]);
+
+        yield* session.readThreadSnapshot({
+          providerThread: otherProviderThread,
+        });
+        yield* Deferred.await(interrupted[4]);
+        yield* session.resumeThread({
+          providerThread,
+          modelSelection,
+        });
+
+        // 6. Admitting a late continuation cancels the sixth in-flight suggestion and suppresses
+        //    sampling while the continuation remains pending.
+        yield* session.startTurn(makeTurn(6, { text: "Sixth turn" }));
+        yield* until((event) => event.type === "turn.terminal");
+        yield* Deferred.await(started[5]);
 
         yield* emitSessionUpdate({
           sessionId: "mock-suggestion-session",
@@ -2902,25 +2962,25 @@ describe("AntigravityAdapterV2 prompt suggestions", () => {
           },
         });
         const offeredRequest = yield* Deferred.await(continuationOffered);
-        yield* Deferred.await(interrupted[3]);
+        yield* Deferred.await(interrupted[5]);
 
-        yield* session.startTurn(makeTurn(5, { text: "Fifth turn while continuation pending" }));
+        yield* session.startTurn(makeTurn(7, { text: "Seventh turn while continuation pending" }));
         yield* until((event) => event.type === "turn.terminal");
-        assert.equal(callCount, 4);
+        assert.equal(callCount, 6);
 
-        // 5. Once the pending continuation clears, a subsequent normal turn emits its suggestion.
+        // 7. Once the pending continuation clears, a subsequent normal turn emits its suggestion.
         yield* offeredRequest.clearIfCurrent?.() ?? Effect.void;
-        const turn6 = makeTurn(6, { text: "Sixth turn" });
-        yield* session.startTurn(turn6);
-        const events6 = yield* until((event) => event.type === "prompt_suggestion.updated");
+        const turn8 = makeTurn(8, { text: "Eighth turn" });
+        yield* session.startTurn(turn8);
+        const events8 = yield* until((event) => event.type === "prompt_suggestion.updated");
         assert.deepEqual(
-          events6.filter((event) => event.type === "prompt_suggestion.updated"),
+          events8.filter((event) => event.type === "prompt_suggestion.updated"),
           [
             {
               type: "prompt_suggestion.updated",
               driver: "antigravity",
-              threadId: turn6.threadId,
-              runId: turn6.runId,
+              threadId: turn8.threadId,
+              runId: turn8.runId,
               text: "run the test suite",
             },
           ],

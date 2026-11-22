@@ -1987,6 +1987,8 @@ interface SnapshotMessageState {
   readonly messages: Map<string, OrchestrationV2ConversationMessage>;
   /** Messages loaded from thought chunks; `messages` stores them as assistant text. */
   readonly reasoningIds: ReadonlySet<OrchestrationV2ConversationMessage["id"]>;
+  /** Leading handoff context length per stored user message, stripped for prompt suggestions. */
+  readonly inlineContextLengths: Map<string, number>;
   loadingRole: "user" | "assistant" | "thought" | null;
   loadingMessageId: string | null;
   loadingIndex: number;
@@ -1996,6 +1998,7 @@ const emptySnapshotState = (): SnapshotMessageState => ({
   order: [],
   messages: new Map(),
   reasoningIds: new Set(),
+  inlineContextLengths: new Map(),
   loadingRole: null,
   loadingMessageId: null,
   loadingIndex: 0,
@@ -2650,10 +2653,14 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             ) {
               continue;
             }
+            const inlineContextLength =
+              state.inlineContextLengths.get(key) ??
+              (message.id === context.input.message.messageId
+                ? context.input.inlineContextLength
+                : undefined);
             const rawText =
-              message.id === context.input.message.messageId &&
-              context.input.inlineContextLength !== undefined
-                ? message.text.slice(context.input.inlineContextLength)
+              inlineContextLength !== undefined
+                ? message.text.slice(inlineContextLength)
                 : message.text;
             const text = rawText.trim();
             if (text.length === 0) continue;
@@ -3205,11 +3212,19 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             : undefined;
         });
 
-        const rememberSnapshotMessage = (message: OrchestrationV2ConversationMessage) =>
+        const rememberSnapshotMessage = (
+          message: OrchestrationV2ConversationMessage,
+          inlineContextLength?: number,
+        ) =>
           Ref.update(snapshot, (current) => {
             const key = String(message.id);
             if (!current.messages.has(key)) current.order.push(key);
             current.messages.set(key, message);
+            if (inlineContextLength !== undefined && inlineContextLength > 0) {
+              current.inlineContextLengths.set(key, inlineContextLength);
+            } else {
+              current.inlineContextLengths.delete(key);
+            }
             return current;
           });
 
@@ -8837,8 +8852,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           ) {
             const sessionId = yield* Ref.get(activeSessionId);
             if (sessionId !== null) {
-              offeredContinuation = true;
-              yield* offerContinuationRun(sessionId);
+              offeredContinuation = yield* offerContinuationRun(sessionId);
             }
           }
           if (settledStatus !== "completed") {
@@ -9619,26 +9633,29 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               driver,
               providerThread: activeProviderThread,
             });
-            yield* rememberSnapshotMessage({
-              createdBy: turnInput.message.createdBy,
-              creationSource: turnInput.message.creationSource,
-              ...(turnInput.message.scheduledTaskId === undefined
-                ? {}
-                : { scheduledTaskId: turnInput.message.scheduledTaskId }),
-              ...(turnInput.message.senderThreadId === undefined
-                ? {}
-                : { senderThreadId: turnInput.message.senderThreadId }),
-              id: turnInput.message.messageId,
-              threadId: turnInput.threadId,
-              runId: turnInput.runId,
-              nodeId: turnInput.rootNodeId,
-              role: "user",
-              text: turnInput.message.text,
-              attachments: [...turnInput.message.attachments],
-              streaming: false,
-              createdAt: startedAt,
-              updatedAt: startedAt,
-            });
+            yield* rememberSnapshotMessage(
+              {
+                createdBy: turnInput.message.createdBy,
+                creationSource: turnInput.message.creationSource,
+                ...(turnInput.message.scheduledTaskId === undefined
+                  ? {}
+                  : { scheduledTaskId: turnInput.message.scheduledTaskId }),
+                ...(turnInput.message.senderThreadId === undefined
+                  ? {}
+                  : { senderThreadId: turnInput.message.senderThreadId }),
+                id: turnInput.message.messageId,
+                threadId: turnInput.threadId,
+                runId: turnInput.runId,
+                nodeId: turnInput.rootNodeId,
+                role: "user",
+                text: turnInput.message.text,
+                attachments: [...turnInput.message.attachments],
+                streaming: false,
+                createdAt: startedAt,
+                updatedAt: startedAt,
+              },
+              turnInput.inlineContextLength,
+            );
             if (followsAgentWorkState)
               yield* runtimeCallbackPermit.withPermit(syncNativeChildren(context));
             const attached = turnAttached;
@@ -10102,6 +10119,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                     threadInput.providerThread.appThreadId,
                   ).pipe(Effect.tapError(() => restorePreviousItemIdentity));
                   if ((yield* Ref.get(activeSessionId)) !== sessionId || restartAfterInterrupt) {
+                    yield* cancelPromptSuggestion();
                     yield* Ref.set(snapshot, emptySnapshotState());
                     const activated = yield* activateSession(
                       sessionId,
@@ -10642,6 +10660,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                         detail: "ACP driver does not support session/load snapshots",
                       });
                     }
+                    yield* cancelPromptSuggestion();
                     yield* Ref.set(snapshot, emptySnapshotState());
                     const mcpContext = yield* readMcpContext(
                       snapshotInput.providerThread.appThreadId,
